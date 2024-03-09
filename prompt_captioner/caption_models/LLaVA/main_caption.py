@@ -160,7 +160,8 @@ class my_dataset(Dataset):
         except Exception as e:
             print('Read video error in {},{} and we have skip this !, this will not cause error!'.format(idx,e))
             return self.skip_sample(idx)
-        
+            #  
+             
 
 
 # model_path = "liuhaotian/llava-v1.5-7b"
