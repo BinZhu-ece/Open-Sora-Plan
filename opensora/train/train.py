@@ -48,25 +48,27 @@ def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup accelerator:
-    accelerator = Accelerator()
+    accelerator = Accelerator(mixed_precision=args.mixed_precision, gradient_accumulation_steps=args.gradient_accumulation_steps)
     device = accelerator.device
-    args.mixed_precision = accelerator.mixed_precision
-    args.gradient_accumulation_steps = accelerator.gradient_accumulation_steps
 
     # Setup an experiment folder:
-    if accelerator.is_main_process:
-        print(args)
-        os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
+    if args.resume_from_checkpoint:
+        experiment_dir = f"{args.results_dir}/{args.resume_from_checkpoint}"
+    else:
         experiment_index = len(glob(f"{args.results_dir}/*"))
-        model_string_name = args.model.replace("/", "-")  # e.g., Latte-XL/2 --> Latte-XL-2 (for naming folders)
+        model_string_name = args.model.replace("/", "-")  # e.g., Latte-XL/122 --> Latte-XL-122 (for naming folders)
+        ae_string_name = args.ae.split("/")[-1]  # e.g., stabilityai/sd-vae-ft-mse --> sd-vae-ft-mse (for naming folders)
         num_frame_string = 'F' + str(args.num_frames) + 'S' + str(args.sample_rate)
-        experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}-{num_frame_string}-{args.dataset}"  # Create an experiment folder
+        experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}-{ae_string_name}-{num_frame_string}-{args.dataset}"  # Create an experiment folder
         experiment_dir = get_experiment_dir(experiment_dir, args)
-        checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
+    checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
+    if accelerator.is_main_process:
+        os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         tb_writer = create_tensorboard(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
+        logger.info(f'{args}')
     else:
         logger = create_logger(None)
         tb_writer = None
@@ -79,10 +81,10 @@ def main(args):
     patch_size_t, patch_size_h, patch_size_w = int(patch_size[0]), int(patch_size[1]), int(patch_size[2])
     args.patch_size = patch_size_h
     args.patch_size_t, args.patch_size_h, args.patch_size_w = patch_size_t, patch_size_h, patch_size_w
-    assert args.num_frames % ae_stride_t == 0, "Image size must be divisible by 8 (for the VAE encoder)."
-    assert args.max_image_size % ae_stride_h == 0, "Image size must be divisible by 8 (for the VAE encoder)."
-    assert ae_stride_h == ae_stride_w, "Support now."
-    assert patch_size_h == patch_size_w, "Support now."
+    assert ae_stride_h == ae_stride_w, f"Support only ae_stride_h == ae_stride_w now, but found ae_stride_h ({ae_stride_h}), ae_stride_w ({ae_stride_w})"
+    assert patch_size_h == patch_size_w, f"Support only patch_size_h == patch_size_w now, but found patch_size_h ({patch_size_h}), patch_size_w ({patch_size_w})"
+    assert args.num_frames % ae_stride_t == 0, f"Num_frames must be divisible by ae_stride_t, but found num_frames ({args.num_frames}), ae_stride_t ({ae_stride_t})."
+    assert args.max_image_size % ae_stride_h == 0, f"Image size must be divisible by ae_stride_h, but found max_image_size ({args.max_image_size}),  ae_stride_h ({ae_stride_h})."
 
     latent_size = (args.max_image_size // ae_stride_h, args.max_image_size // ae_stride_w)
 
@@ -91,53 +93,46 @@ def main(args):
         num_classes=args.num_classes,
         in_channels=ae_channel_config[args.ae],
         extras=args.extras,
-        num_frames=args.num_frames // ae_stride_t
+        num_frames=args.num_frames // ae_stride_t,
+        attention_mode=args.attention_mode
     )
     model.gradient_checkpointing = args.gradient_checkpointing
 
     # # use pretrained model?
     if args.pretrained:
-        checkpoint = torch.load(args.pretrained, map_location='cpu')
-        if "ema" in checkpoint:  # supports checkpoints from train.py
-            logger.info('Using ema ckpt!')
-            checkpoint = checkpoint["ema"]
-        elif "model" in checkpoint:  # supports checkpoints from train.py
-            logger.info('Using model ckpt!')
-            checkpoint = checkpoint["model"]
-        if 'temp_embed' in checkpoint:
-            del checkpoint['temp_embed']
-        if 'pos_embed' in checkpoint:
-            del checkpoint['pos_embed']
-        model_dict = model.state_dict()
-        # 1. filter out unnecessary keys
-        pretrained_dict = {}
-        for k, v in checkpoint.items():
-            if k in model_dict:
-                pretrained_dict[k] = v
-            else:
-                logger.info('Ignoring: {}'.format(k))
-        logger.info('Successfully Load {}% original pretrained model weights '.format(len(pretrained_dict) / len(checkpoint.items()) * 100))
-        # 2. overwrite entries in the existing state dict
-        model_dict.update(pretrained_dict)
-        msg = model.load_state_dict(model_dict, strict=False)
-        logger.info('Successfully load model at {}!'.format(args.pretrained))
-        logger.info(f'{msg}')
+        # load from pixart-alpha
+        pixelart_alpha = torch.load(args.pretrained, map_location='cpu')['state_dict']
+        checkpoint = {}
+        for k, v in pixelart_alpha.items():
+            if 'x_embedder' in k or 't_embedder' in k:
+                checkpoint[k] = v
+            if k.startswith('blocks'):
+                if 'cross_attn' not in k and 'drop_path' not in k and 'scale_shift_table' not in k:
+                    if 'q_norm' not in k and 'k_norm' not in k:
+                        blk_id = k[7]
+                        new_k = f'blocks.{str(int(blk_id) * 2)}{k[8:]}'
+                        checkpoint[new_k] = v
+        total_load = set(model.state_dict().keys()) & set(checkpoint.keys())
+        msg = model.load_state_dict(checkpoint, strict=False)
+        logger.info(f'Successfully load {len(total_load)} keys from {args.pretrained}!')
 
     model = model.to(device)
     # Note that parameter initialization is done within the DiT constructor
-    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
-    requires_grad(ema, False)
+    if args.use_ema:
+        ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+        requires_grad(ema, False)
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
 
     if args.use_compile:
         model = torch.compile(model)
 
     ae = getae(args).to(device)
-    logger.info(f"{model}")
-    logger.info(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    for n, p in model.named_parameters():
-        if p.requires_grad:
-            logger.info(f"Training Parameters: {n}")
+    if accelerator.is_main_process:
+        logger.info(f"{model}")
+        logger.info(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                logger.info(f"Training Parameters: {n}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0)
@@ -165,9 +160,10 @@ def main(args):
     )
 
     # Prepare models for training:
-    update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
+    if args.use_ema:
+        update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
+        ema.eval()  # EMA model should always be in eval mode
     model.train()  # important! This enables embedding dropout for classifier-free guidance
-    ema.eval()  # EMA model should always be in eval mode
     model, opt, loader, lr_scheduler = accelerator.prepare(model, opt, loader, lr_scheduler)
 
     # Variables for monitoring/logging purposes:
@@ -184,14 +180,16 @@ def main(args):
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
-        # TODO, need to checkout
         # Get the most recent checkpoint
         dirs = os.listdir(os.path.join(experiment_dir, 'checkpoints'))
         dirs = [d for d in dirs if d.endswith("pt")]
         dirs = sorted(dirs, key=lambda x: int(x.split(".")[0]))
         path = dirs[-1]
+        state_dict = torch.load(os.path.join(os.path.join(experiment_dir, 'checkpoints'), path), map_location='cpu')
+        print(state_dict['args'])
+        state_dict = {'module.'+k: v for k, v in state_dict['model'].items()}
         logger.info(f"Resuming from checkpoint {path}")
-        model.load_state(os.path.join(dirs, path))
+        model.load_state_dict(state_dict)
         train_steps = int(path.split(".")[0])
 
         first_epoch = train_steps // num_update_steps_per_epoch
@@ -205,6 +203,14 @@ def main(args):
 
     if accelerator.is_main_process:
         logger.info(f"Training for {num_train_epochs} epochs...")
+
+    if args.mixed_precision == "bf16":
+        dtype = torch.bfloat16
+    elif args.mixed_precision == "fp16":
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
+
     for epoch in range(first_epoch, num_train_epochs):
         logger.info(f"Beginning epoch {epoch}...")
         for step, (x, y, attn_mask) in enumerate(loader):
@@ -217,18 +223,17 @@ def main(args):
                 # Map input images to latent space + normalize latents
                 x = ae.encode(x)  # B C T H W -> B T C H W
 
-
             if args.extras == 78: # text-to-video
                 raise 'T2V training are Not supported at this moment!'
             elif args.extras == 2:
-                model_kwargs = dict(y=y, attention_mask=attn_mask)
+                model_kwargs = dict(y=y, attn_mask=attn_mask)
             else:
-                model_kwargs = dict(y=None, attention_mask=attn_mask)
-
-            t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-            loss = loss_dict["loss"].mean()
-            opt.zero_grad()
+                model_kwargs = dict(y=None, attn_mask=attn_mask)
+            with torch.autocast(device_type='cuda', dtype=dtype):
+                t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
+                loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+                loss = loss_dict["loss"].mean()
+                opt.zero_grad()
 
             accelerator.backward(loss)
 
@@ -239,7 +244,8 @@ def main(args):
 
             opt.step()
 
-            update_ema(ema, model.module)
+            if args.use_ema:
+                update_ema(ema, model.module)
 
             # Log loss values:
             running_loss += loss.item()
@@ -271,10 +277,11 @@ def main(args):
                 if accelerator.is_main_process:
                     checkpoint = {
                         "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
                         "args": args
                     }
+                    if args.use_ema:
+                        checkpoint.update({"ema": ema.state_dict()})
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
@@ -304,22 +311,22 @@ if __name__ == "__main__":
 
 
     # --------------------------------------
-    parser.add_argument("--ae", type=str, choices=['bair_stride4x2x2', 'ucf101_stride4x4x4',
-                                                    'kinetics_stride4x4x4', 'kinetics_stride2x4x4',
-                                                   'stabilityai/sd-vae-ft-mse', 'stabilityai/sd-vae-ft-ema'],
-                        default="ucf101_stride4x4x4")
+    parser.add_argument("--ae", type=str, default="ucf101_stride4x4x4")
     parser.add_argument("--extras", type=int, default=2, choices=[1, 2, 78])
     parser.add_argument("--pretrained", type=str, default=None)
     parser.add_argument("--sample-rate", type=int, default=4)
     parser.add_argument("--num-frames", type=int, default=16)
     parser.add_argument("--max-image-size", type=int, default=128)
     parser.add_argument("--dynamic-frames", action="store_true")
-    parser.add_argument("--resume-from-checkpoint", action="store_true")
+    parser.add_argument("--resume-from-checkpoint", type=str, default=None)
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--use-compile", action="store_true")
+    parser.add_argument("--use-ema", action="store_true")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lr-warmup-steps", type=int, default=0)
-
+    parser.add_argument("--attention-mode", type=str, choices=['xformers', 'math', 'flash'], default="math")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--mixed-precision", type=str, default=None, choices=[None, "fp16", "bf16"])
     parser.add_argument("--clip-grad-norm", default=None, type=float, help="the maximum gradient norm (default None)")
     # --------------------------------------
 
